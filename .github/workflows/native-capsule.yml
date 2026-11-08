@@ -41,7 +41,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     permissions:
-      contents: read
+      contents: write
     env:
       BRIDGE_MODE: ${{ inputs.mode }}
       BRIDGE_FAIL: ${{ inputs.fail_fixture }}
