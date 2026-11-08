@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import plistlib
 from pathlib import Path
 import posixpath
 import re
@@ -273,6 +274,26 @@ def stop_owned(executable, env):
     require(not owned_pids(executable, env), 'owned_cleanup')
 
 
+def unsandboxed_entitlements(app_root, directory):
+    """Debug/XCTest-only copy of DebugProfile entitlements with App Sandbox off.
+
+    macOS 14+ may prompt before a differently signed sandboxed build with the same
+    bundle ID opens an existing container; Flutter's own CI disables sandboxing
+    the same way. The shipped Release app and the source tree are unchanged.
+    """
+    original = Path(app_root) / 'macos/Runner/DebugProfile.entitlements'
+    require(original.is_file() and not original.is_symlink(), 'debug_entitlements')
+    values = plistlib.loads(original.read_bytes())
+    require(isinstance(values, dict) and values.get('com.apple.security.app-sandbox') is True,
+            'debug_entitlements')
+    values['com.apple.security.app-sandbox'] = False
+    directory = Path(directory)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = directory / 'DebugProfileWithDisabledSandboxing.entitlements'
+    target.write_bytes(plistlib.dumps(values, fmt=plistlib.FMT_XML))
+    return target
+
+
 def launch(executable, screenshot, env, log):
     stop_owned(executable, env)  # retire only our exact XCTest host
     proc = None
@@ -344,10 +365,15 @@ def native(root, source, config):
         with log.open('xb') as stream:
             for argv, timeout in commands:
                 require(bridge.private_process(argv, root, stream, timeout=timeout) == 0, 'sdk_install')
+            # A fresh SDK bootstraps (Dart SDK download, tool build, pub output) on its
+            # first command and prints that to stdout. Warm it up first, exactly like
+            # build_release.sh, so the machine JSON below is not contaminated.
+            require(bridge.private_process([str(sdk / 'bin/flutter'), '--version'],
+                root, stream, timeout=1200) == 0, 'sdk_bootstrap')
             version_path = root / 'sdk-version.json'
             with version_path.open('xb') as version:
                 code = bridge.private_process([str(sdk / 'bin/flutter'), '--version', '--machine'],
-                    root, version, stderr=stream, timeout=1200)
+                    root, version, stderr=stream, timeout=600)
             data = version_path.read_bytes()
             stream.write(data)
             require(code == 0 and json.loads(data)['frameworkRevision'] == FLUTTER, 'sdk_revision')
@@ -378,14 +404,20 @@ def native(root, source, config):
             bundle = app_root / 'build/macos/Build/Products/Debug/Carbonic.app'
             executable = bundle / 'Contents/MacOS/Carbonic'
             xcresult = root / ('runtime-' + arch + '.xcresult')
+            entitlements = root / 'tmp' / ('debug-entitlements-' + arch) / 'DebugProfileWithDisabledSandboxing.entitlements'
             # Preserve locked resolution/analyze/widget gates on each fresh branch.
-            stage('debug_build_' + arch, run('debug_build_' + arch,
-                ['bash', '-euc', 'flutter pub get --enforce-lockfile; flutter analyze; flutter test; flutter build macos --debug'],
-                cwd=app_root, timeout=1800))
+            def debug_build():
+                unsandboxed_entitlements(app_root, entitlements.parent)
+                return run('debug_build_' + arch, ['bash', '-euc',
+                    'flutter pub get --enforce-lockfile; flutter analyze; flutter test; '
+                    'FLUTTER_XCODE_CODE_SIGN_ENTITLEMENTS="$1" flutter build macos --debug',
+                    'debug_build', str(entitlements)], cwd=app_root, timeout=1800)()
+            stage('debug_build_' + arch, debug_build)
             stage('xctest_' + arch, run('xctest_' + arch, ['xcodebuild', 'test', '-workspace',
                 'macos/Runner.xcworkspace', '-scheme', 'Runner', '-configuration', 'Debug', '-destination',
                 'platform=macOS,arch=' + arch, '-derivedDataPath', str(app_root / 'build/macos'),
-                'ARCHS=' + arch, 'ONLY_ACTIVE_ARCH=YES', '-resultBundlePath', str(xcresult), 'CODE_SIGN_IDENTITY=-'],
+                'ARCHS=' + arch, 'ONLY_ACTIVE_ARCH=YES', '-resultBundlePath', str(xcresult), 'CODE_SIGN_IDENTITY=-',
+                'CODE_SIGN_ENTITLEMENTS=' + str(entitlements)],
                 cwd=app_root, timeout=1800))
             def summary():
                 output = evidence / ('xctest-results-' + arch + '.json')
