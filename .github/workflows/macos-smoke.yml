@@ -1,0 +1,117 @@
+name: Public Carbonic cask smoke
+on:
+  workflow_dispatch:
+  push:
+    paths: ['Casks/**', '.github/workflows/macos-smoke.yml']
+permissions:
+  contents: read
+concurrency:
+  group: public-carbonic-macos-smoke-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  install-public-cask:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_ANALYTICS: '1'
+      HOMEBREW_NO_INSTALL_FROM_API: '1'
+      HOMEBREW_CACHE: ${{ github.workspace }}/build/cache
+      HOMEBREW_LOGS: ${{ github.workspace }}/build/logs
+      HOMEBREW_TEMP: ${{ github.workspace }}/build/tmp
+      TMPDIR: ${{ github.workspace }}/build/tmp
+      TMP: ${{ github.workspace }}/build/tmp
+      TEMP: ${{ github.workspace }}/build/tmp
+      XDG_CACHE_HOME: ${{ github.workspace }}/build/cache
+      XDG_CONFIG_HOME: ${{ github.workspace }}/build/config
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install the public tap and verify the actual payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/build/evidence"
+          APPDIR="$GITHUB_WORKSPACE/build/Applications"
+          TOKEN=grappeggia/carbonic/carbonic
+          mkdir -p "$OUT" "$APPDIR" "$TMPDIR" "$HOMEBREW_CACHE"
+          cleanup() {
+            result=$?
+            trap - EXIT
+            if brew list --cask carbonic >/dev/null 2>&1; then
+              brew uninstall --cask "$TOKEN" >> "$OUT/cleanup.log" 2>&1 || { if [ "$result" -eq 0 ]; then result=1; fi; }
+            fi
+            exit "$result"
+          }
+          trap cleanup EXIT
+          brew --version | tee "$OUT/brew-version.txt"
+          brew tap grappeggia/carbonic
+          brew style --cask "$TOKEN" 2>&1 | tee "$OUT/style.txt"
+          brew trust --cask "$TOKEN" 2>&1 | tee "$OUT/cask-trust.txt"
+          brew trust --json=v1 > "$OUT/trust.json"
+          brew audit --cask "$TOKEN" 2>&1 | tee "$OUT/audit.txt"
+          brew info --cask --json=v2 "$TOKEN" > "$OUT/cask.json"
+          curl --fail --location --retry 2 --max-time 120 https://github.com/Grappeggia/homebrew-carbonic/releases/download/v0.1.1-2/manifest.json --output "$OUT/manifest.json"
+          curl --fail --location --retry 2 --max-time 180 https://github.com/Grappeggia/homebrew-carbonic/releases/download/v0.1.1-2/Carbonic-0.1.1-2-macos-universal2.zip --output "$OUT/Carbonic-0.1.1-2-macos-universal2.zip"
+          python3 - "$OUT" <<'PY'
+          import hashlib, json, pathlib, sys
+          out = pathlib.Path(sys.argv[1])
+          manifest = json.loads((out / 'manifest.json').read_text())
+          trust = json.loads((out / 'trust.json').read_text())
+          assert trust == dict(taps=[], formulae=[], casks=['grappeggia/carbonic/carbonic'], commands=[])
+          asset = manifest['artifact']
+          archive = out / asset['name']
+          assert manifest['version'] == '0.1.1' and manifest['build'] == '2'
+          assert manifest['source_commit'] == 'c500d69a2228efba86ad49769998d61ea1d4f7ae'
+          assert asset['sha256'] == 'e29b2c5cce855f7ab4a9f3cdc707ef1a0a8c6e3b9a31174c6d90c8a8d60d0be1'
+          assert archive.stat().st_size == asset['bytes']
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == asset['sha256']
+          cask = json.loads((out / 'cask.json').read_text())['casks'][0]
+          assert cask['version'] == '0.1.1,2' and cask['sha256'] == asset['sha256']
+          assert cask['url'] == 'https://github.com/Grappeggia/homebrew-carbonic/releases/download/v0.1.1-2/' + asset['name']
+          PY
+          brew install --cask --appdir="$APPDIR" grappeggia/carbonic/carbonic 2>&1 | tee "$OUT/install.txt"
+          APP="$APPDIR/Carbonic.app"
+          python3 - "$APP" "$OUT" <<'PY'
+          import json, pathlib, plistlib, subprocess, sys
+          app, out = map(pathlib.Path, sys.argv[1:])
+          info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+          for key, value in dict(CFBundleIdentifier='org.carbonic.carbonicapp', CFBundleName='Carbonic', CFBundleExecutable='Carbonic', CFBundleShortVersionString='0.1.1', CFBundleVersion='2', LSMinimumSystemVersion='14.0').items():
+              assert info.get(key) == value, (key, info.get(key))
+          inventory = {}
+          magic = {bytes.fromhex(h) for h in ('cafebabe', 'cafebabf', 'bebafeca', 'bfbafeca', 'cffaedfe', 'cefaedfe', 'feedfacf', 'feedface')}
+          for file in app.rglob('*'):
+              if not file.is_file() or file.is_symlink():
+                  continue
+              with file.open('rb') as stream:
+                  header = stream.read(4)
+              if header in magic:
+                  arches = sorted(subprocess.check_output(['lipo', '-archs', str(file)], text=True).split())
+                  assert arches == ['arm64', 'x86_64'], (str(file), arches)
+                  inventory['Carbonic.app/' + str(file.relative_to(app))] = arches
+          manifest = json.loads((out / 'manifest.json').read_text())
+          assert inventory == manifest['mach_o']
+          (out / 'installed-native-inventory.json').write_text(json.dumps(inventory, indent=2) + '\n')
+          PY
+          codesign --verify --deep --strict --verbose=2 "$APP" > "$OUT/codesign-verify.txt" 2>&1
+          codesign -d --verbose=4 "$APP" > "$OUT/codesign-details.txt" 2>&1
+          grep -q 'Signature=adhoc' "$OUT/codesign-details.txt"
+          xattr -p com.apple.quarantine "$APP" > "$OUT/quarantine.txt"
+          set +e
+          spctl --assess --type execute --verbose=4 "$APP" > "$OUT/gatekeeper.txt" 2>&1
+          assessment=$?
+          set -e
+          printf '%s\n' "$assessment" > "$OUT/gatekeeper-exit.txt"
+          test "$assessment" -ne 0
+          grep -qi rejected "$OUT/gatekeeper.txt"
+          brew upgrade --cask --appdir="$APPDIR" "$TOKEN" 2>&1 | tee "$OUT/upgrade-current.txt"
+          brew uninstall --cask "$TOKEN" 2>&1 | tee "$OUT/uninstall.txt"
+          test ! -e "$APP"
+          printf '%s\n' 'PASS public download checksum, cask install, native identity/universal2/integrity/quarantine, expected Gatekeeper rejection, upgrade-current command, uninstall' > "$OUT/result.txt"
+      - name: Retain bounded public installation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: carbonic-public-macos-smoke
+          path: build/evidence/
+          retention-days: 30
+          if-no-files-found: error
