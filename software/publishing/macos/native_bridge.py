@@ -31,12 +31,21 @@ PROJECT = Path(__file__).resolve().parents[3]
 BINDING = protocol.FIELDS
 
 
-def command(argv, *, data=None, limit=protocol.MAX_JSON, timeout=120,
+# GitHub listings/contents grow with history (one run object is ~13 KiB and a
+# commit object embeds its whole patch); bound them separately from MAX_JSON.
+API_LISTING_LIMIT = 4 * 1024 * 1024
+# Default per-command bound stays 120 s. Only the bounded artifact ZIP and run-log
+# downloads (production return ~110 MB) may take longer on a slow/loaded host.
+COMMAND_TIMEOUT = 120
+DOWNLOAD_TIMEOUT = 1800
+
+
+def command(argv, *, data=None, limit=protocol.MAX_JSON, timeout=COMMAND_TIMEOUT,
             stderr_limit=protocol.MAX_JSON):
     """Bound both pipes while reading; kill/reap our process group on refusal."""
     require(type(limit) is int and 0 < limit <= 512 * 1024 * 1024
             and type(stderr_limit) is int and 0 < stderr_limit <= protocol.MAX_JSON
-            and 0 < timeout <= 120 and (data is None or
+            and 0 < timeout <= DOWNLOAD_TIMEOUT and (data is None or
                 isinstance(data, bytes) and len(data) <= protocol.MAX_JSON), 'local_command')
     proc, completed = None, False
     selector = selectors.DefaultSelector()
@@ -95,17 +104,13 @@ def command(argv, *, data=None, limit=protocol.MAX_JSON, timeout=120,
                     stream.close()
 
 
-# GitHub listings/contents grow with history (one run object is ~13 KiB and a
-# commit object embeds its whole patch); bound them separately from MAX_JSON.
-API_LISTING_LIMIT = 4 * 1024 * 1024
-
-
-def gh(endpoint, *, payload=None, method='GET', raw=False, limit=protocol.MAX_JSON):
+def gh(endpoint, *, payload=None, method='GET', raw=False, limit=protocol.MAX_JSON, timeout=COMMAND_TIMEOUT):
     require(endpoint.startswith(('repos/', 'https://uploads.github.com/repos/')), 'api_endpoint')
     args = ['gh', 'api', '--method', method, '-H', 'X-GitHub-Api-Version: 2022-11-28', endpoint]
     if payload is not None:
         args += ['--input', '-']
-    result = command(args, data=None if payload is None else json.dumps(payload).encode(), limit=limit)
+    result = command(args, data=None if payload is None else json.dumps(payload).encode(), limit=limit,
+                     timeout=timeout)
     return result if raw else (json.loads(result) if result else None)
 
 
@@ -245,7 +250,7 @@ def get_artifact(receipt, phase, *, listed=None, canary=None):
     recorded = {k: item[k] for k in ('id', 'digest', 'name')}
     require(previous is None or previous == recorded, 'artifact_changed')
     raw = gh(f"repos/{receipt['binding']['repository']}/actions/artifacts/{item['id']}/zip",
-             raw=True, limit=protocol.return_policy(receipt)[0])
+             raw=True, limit=protocol.return_policy(receipt)[0], timeout=DOWNLOAD_TIMEOUT)
     require('sha256:' + protocol.digest(raw) == item['digest'], 'artifact_hash')
     expected = ('recipient.pem', 'identity.json') if phase == 'recipient' else ('encrypted-return.cms', 'identity.json')
     members = zip_members(raw, expected, cap=protocol.return_policy(receipt)[0])
@@ -635,7 +640,7 @@ def collect(path):
         canary, rejected = verify_native(files, receipt, run, identity)
     del receipt['_root']
     logs = gh(f"repos/{receipt['binding']['repository']}/actions/runs/{run['id']}/logs",
-              raw=True, limit=protocol.MAX_PAYLOAD)
+              raw=True, limit=protocol.MAX_PAYLOAD, timeout=DOWNLOAD_TIMEOUT)
     scan_logs(logs, canary)
     out = root / 'reviewed-return'
     out.mkdir(mode=0o700, exist_ok=True)
