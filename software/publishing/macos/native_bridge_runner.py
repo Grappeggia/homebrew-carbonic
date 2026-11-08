@@ -296,7 +296,7 @@ def native_fixture(root, source, config):
         ('compile_arm64', ['xcrun', 'clang', '-arch', 'arm64', '-Werror', main, '-o', arm]),
         ('compile_x86_64', ['xcrun', 'clang', '-arch', 'x86_64', '-Werror', main, '-o', intel]),
         ('lipo', ['xcrun', 'lipo', '-create', arm, intel, '-output', fat]),
-        ('lipo_verify', ['xcrun', 'lipo', '-verify_arch', 'arm64', 'x86_64', fat]),
+        ('lipo_verify', ['xcrun', 'lipo', fat, '-verify_arch', 'arm64', 'x86_64']),
         ('sign', ['codesign', '--force', '--sign', '-', fat]),
         ('verify_signature', ['codesign', '--verify', '--strict', '--verbose=2', fat]),
         ('runtime_arm64', ['arch', '-arm64', fat]),
