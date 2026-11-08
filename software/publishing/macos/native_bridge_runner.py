@@ -402,7 +402,14 @@ def execute(root, config, api):
     source = root / 'source'
     key = root / 'recipient/recipient.key'
     try:
-        encrypted = receive(root, config, api)
+        try:
+            encrypted = receive(root, config, api)
+        except BridgeError as exc:
+            if str(exc) == 'http_403':
+                print('NATIVE_FIXTURE_RECEIVE_HTTP_403')
+            elif str(exc) == 'http_404':
+                print('NATIVE_FIXTURE_RECEIVE_HTTP_404')
+            raise
         tar = root / 'capsule.tar'
         capsule.decrypt(encrypted, root / 'recipient/recipient.pem', key, tar,
                         config['capsule_sha256'], openssl=openssl)
