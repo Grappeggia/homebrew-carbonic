@@ -1,0 +1,95 @@
+name: Encrypted native fixture
+run-name: native-fixture-${{ inputs.nonce }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [fixture]
+        default: fixture
+        required: true
+      fail_fixture:
+        type: boolean
+        default: false
+        required: true
+      nonce:
+        type: string
+        required: true
+      draft_release_id:
+        type: string
+        required: true
+      capsule_sha256:
+        type: string
+        required: true
+      source_sha:
+        type: string
+        required: true
+      return_cert_sha256:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-fixture-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  fixture:
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      BRIDGE_MODE: ${{ inputs.mode }}
+      BRIDGE_FAIL: ${{ inputs.fail_fixture }}
+      BRIDGE_NONCE: ${{ inputs.nonce }}
+      BRIDGE_DRAFT_ID: ${{ inputs.draft_release_id }}
+      BRIDGE_CAPSULE_SHA256: ${{ inputs.capsule_sha256 }}
+      BRIDGE_SOURCE: ${{ inputs.source_sha }}
+      BRIDGE_RETURN_CERT_SHA256: ${{ inputs.return_cert_sha256 }}
+      BRIDGE_ROOT: ${{ github.workspace }}/build/native-bridge/${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.nonce }}
+      TMPDIR: ${{ github.workspace }}/build/native-bridge-tmp
+      TMP: ${{ github.workspace }}/build/native-bridge-tmp
+      TEMP: ${{ github.workspace }}/build/native-bridge-tmp
+      XDG_CACHE_HOME: ${{ github.workspace }}/build/native-bridge-cache
+      HOMEBREW_CACHE: ${{ github.workspace }}/build/native-bridge-brew-cache
+      HOMEBREW_LOGS: ${{ github.workspace }}/build/native-bridge-brew-logs
+      HOMEBREW_TEMP: ${{ github.workspace }}/build/native-bridge-tmp
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_ANALYTICS: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Recipient handshake
+        run: python3 software/publishing/macos/native_bridge_runner.py init
+      - name: Public recipient only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-recipient-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.nonce }}
+          path: |
+            ${{ env.BRIDGE_ROOT }}/public-recipient/recipient.pem
+            ${{ env.BRIDGE_ROOT }}/public-recipient/identity.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Receive, native fixture, encrypted return
+        id: execute
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 software/publishing/macos/native_bridge_runner.py execute
+      - name: Encrypted return only
+        if: ${{ always() && steps.execute.outputs.sealed == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-return-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.nonce }}
+          path: |
+            ${{ env.BRIDGE_ROOT }}/public-return/encrypted-return.cms
+            ${{ env.BRIDGE_ROOT }}/public-return/identity.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Best effort private cleanup
+        if: ${{ always() }}
+        run: python3 software/publishing/macos/native_bridge_runner.py cleanup
