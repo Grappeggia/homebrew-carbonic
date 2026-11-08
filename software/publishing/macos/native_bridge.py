@@ -95,6 +95,11 @@ def command(argv, *, data=None, limit=protocol.MAX_JSON, timeout=120,
                     stream.close()
 
 
+# GitHub listings/contents grow with history (one run object is ~13 KiB and a
+# commit object embeds its whole patch); bound them separately from MAX_JSON.
+API_LISTING_LIMIT = 4 * 1024 * 1024
+
+
 def gh(endpoint, *, payload=None, method='GET', raw=False, limit=protocol.MAX_JSON):
     require(endpoint.startswith(('repos/', 'https://uploads.github.com/repos/')), 'api_endpoint')
     args = ['gh', 'api', '--method', method, '-H', 'X-GitHub-Api-Version: 2022-11-28', endpoint]
@@ -165,12 +170,14 @@ def get_run(receipt, run_id=None):
     if run_id is None:
         run_id = receipt['binding'].get('run_id')
     if run_id is None:
-        listing = gh(f"repos/{repo}/actions/workflows/{receipt['workflow_id']}/runs?event=workflow_dispatch&per_page=100")
+        listing = gh(f"repos/{repo}/actions/workflows/{receipt['workflow_id']}/runs?event=workflow_dispatch"
+                     f"&head_sha={protocol.hexval(receipt['binding']['head_sha'], 40)}&per_page=100",
+                     limit=API_LISTING_LIMIT)
         matches = [r for r in listing['workflow_runs']
                    if r.get('display_title') == 'native-fixture-' + receipt['binding']['nonce']]
         require(len(matches) == 1, 'run_lookup_pending_or_ambiguous')
         run_id = protocol.integer(matches[0]['id'])
-    run = gh(f'repos/{repo}/actions/runs/{protocol.integer(run_id)}')
+    run = gh(f'repos/{repo}/actions/runs/{protocol.integer(run_id)}', limit=API_LISTING_LIMIT)
     validate_run(run, receipt, workflow)
     return run
 
@@ -284,8 +291,10 @@ def _start(args):
                 workflow_id=receipt['workflow_id'], workflow_ref=receipt['binding']['workflow_ref'])
         return {'status': 'resume', 'receipt': str(receipt_path)}
     require(not directory.exists(), 'directory_exists')
-    head = gh(f'repos/{args.repo}/commits/{args.ref}')
-    require(head.get('sha') == args.head, 'ref_changed')
+    # Branch ref object only; the commit endpoint embeds the full patch.
+    head = gh(f'repos/{args.repo}/git/ref/heads/{args.ref}')
+    require(head.get('ref') == 'refs/heads/' + args.ref and head.get('object', {}).get('type') == 'commit'
+            and head['object'].get('sha') == args.head, 'ref_changed')
     workflow = gh(f'repos/{args.repo}/actions/workflows/{args.workflow.rsplit("/", 1)[-1]}')
     require(workflow.get('path') == args.workflow and workflow.get('state') == 'active', 'workflow')
     protocol.integer(workflow.get('id'))
@@ -329,10 +338,12 @@ def _start(args):
                 and wrapper['workflow_sha256'] == args.workflow_sha256, 'reviewed_wrapper')
         remote_wrapper = {}
         for name in native_production.WRAPPERS:
-            value = gh(f'repos/{args.repo}/contents/software/publishing/macos/{name}?ref={args.head}')
+            value = gh(f'repos/{args.repo}/contents/software/publishing/macos/{name}?ref={args.head}',
+                       limit=API_LISTING_LIMIT)
             require(value.get('encoding') == 'base64', 'wrapper_remote')
             remote_wrapper[name] = protocol.digest(base64.b64decode(value['content']))
-        workflow_bytes = gh(f'repos/{args.repo}/contents/{args.workflow}?ref={args.head}')
+        workflow_bytes = gh(f'repos/{args.repo}/contents/{args.workflow}?ref={args.head}',
+                            limit=API_LISTING_LIMIT)
         require(protocol.digest(json.dumps(remote_wrapper, sort_keys=True).encode()) == wrapper['wrapper_sha256']
                 and protocol.digest(base64.b64decode(workflow_bytes['content'])) == wrapper['workflow_sha256'], 'wrapper_remote')
         binding.update(mode='production', **wrapper)
