@@ -50,8 +50,8 @@ jobs:
           brew trust --json=v1 > "$OUT/trust.json"
           brew audit --cask "$TOKEN" 2>&1 | tee "$OUT/audit.txt"
           brew info --cask --json=v2 "$TOKEN" > "$OUT/cask.json"
-          curl --fail --location --retry 2 --max-time 120 https://github.com/Grappeggia/homebrew-carbonic/releases/download/v0.1.1-2/manifest.json --output "$OUT/manifest.json"
-          curl --fail --location --retry 2 --max-time 180 https://github.com/Grappeggia/homebrew-carbonic/releases/download/v0.1.1-2/Carbonic-0.1.1-2-macos-universal2.zip --output "$OUT/Carbonic-0.1.1-2-macos-universal2.zip"
+          curl --fail --location --retry 2 --max-time 120 https://github.com/Grappeggia/homebrew-carbonic/releases/download/v0.1.2-3/manifest.json --output "$OUT/manifest.json"
+          curl --fail --location --retry 2 --max-time 180 https://github.com/Grappeggia/homebrew-carbonic/releases/download/v0.1.2-3/Carbonic-0.1.2-3-macos-universal2.zip --output "$OUT/Carbonic-0.1.2-3-macos-universal2.zip"
           python3 - "$OUT" <<'PY'
           import hashlib, json, pathlib, sys
           out = pathlib.Path(sys.argv[1])
@@ -60,14 +60,14 @@ jobs:
           assert trust == dict(taps=[], formulae=[], casks=['grappeggia/carbonic/carbonic'], commands=[])
           asset = manifest['artifact']
           archive = out / asset['name']
-          assert manifest['version'] == '0.1.1' and manifest['build'] == '2'
-          assert manifest['source_commit'] == 'c500d69a2228efba86ad49769998d61ea1d4f7ae'
-          assert asset['sha256'] == 'e29b2c5cce855f7ab4a9f3cdc707ef1a0a8c6e3b9a31174c6d90c8a8d60d0be1'
+          assert manifest['version'] == '0.1.2' and manifest['build'] == '3'
+          assert manifest['source_commit'] == '941e32d72ccd1eed60884b1c2de34cbb0fc93ad3'
+          assert asset['sha256'] == 'f522ea041f807a6c414155550fbf04609d6e2d6e873b5ce172b9a45ed3deae9c'
           assert archive.stat().st_size == asset['bytes']
           assert hashlib.sha256(archive.read_bytes()).hexdigest() == asset['sha256']
           cask = json.loads((out / 'cask.json').read_text())['casks'][0]
-          assert cask['version'] == '0.1.1,2' and cask['sha256'] == asset['sha256']
-          assert cask['url'] == 'https://github.com/Grappeggia/homebrew-carbonic/releases/download/v0.1.1-2/' + asset['name']
+          assert cask['version'] == '0.1.2,3' and cask['sha256'] == asset['sha256']
+          assert cask['url'] == 'https://github.com/Grappeggia/homebrew-carbonic/releases/download/v0.1.2-3/' + asset['name']
           PY
           brew install --cask --appdir="$APPDIR" grappeggia/carbonic/carbonic 2>&1 | tee "$OUT/install.txt"
           APP="$APPDIR/Carbonic.app"
@@ -75,7 +75,7 @@ jobs:
           import json, pathlib, plistlib, subprocess, sys
           app, out = map(pathlib.Path, sys.argv[1:])
           info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
-          for key, value in dict(CFBundleIdentifier='org.carbonic.carbonicapp', CFBundleName='Carbonic', CFBundleExecutable='Carbonic', CFBundleShortVersionString='0.1.1', CFBundleVersion='2', LSMinimumSystemVersion='14.0').items():
+          for key, value in dict(CFBundleIdentifier='org.carbonic.carbonicapp', CFBundleName='Carbonic', CFBundleExecutable='Carbonic', CFBundleShortVersionString='0.1.2', CFBundleVersion='3', LSMinimumSystemVersion='14.0').items():
               assert info.get(key) == value, (key, info.get(key))
           inventory = {}
           magic = {bytes.fromhex(h) for h in ('cafebabe', 'cafebabf', 'bebafeca', 'bfbafeca', 'cffaedfe', 'cefaedfe', 'feedfacf', 'feedface')}

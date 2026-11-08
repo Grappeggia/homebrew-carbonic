@@ -1,6 +1,6 @@
 cask "carbonic" do
-  version "0.1.1,2"
-  sha256 "e29b2c5cce855f7ab4a9f3cdc707ef1a0a8c6e3b9a31174c6d90c8a8d60d0be1"
+  version "0.1.2,3"
+  sha256 "f522ea041f807a6c414155550fbf04609d6e2d6e873b5ce172b9a45ed3deae9c"
 
   url "https://github.com/Grappeggia/homebrew-carbonic/releases/download/v#{version.csv.first}-#{version.csv.second}/Carbonic-#{version.csv.first}-#{version.csv.second}-macos-universal2.zip"
   name "Carbonic"
