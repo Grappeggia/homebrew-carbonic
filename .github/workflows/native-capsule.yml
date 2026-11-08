@@ -6,7 +6,7 @@ on:
     inputs:
       mode:
         type: choice
-        options: [fixture]
+        options: [fixture, production]
         default: fixture
         required: true
       fail_fixture:
@@ -25,6 +25,12 @@ on:
       source_sha:
         type: string
         required: true
+      wrapper_sha256:
+        type: string
+        default: ""
+      workflow_sha256:
+        type: string
+        default: ""
       return_cert_sha256:
         type: string
         required: true
@@ -39,11 +45,13 @@ concurrency:
 jobs:
   fixture:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 300
     permissions:
       contents: write
     env:
       BRIDGE_MODE: ${{ inputs.mode }}
+      BRIDGE_WRAPPER_SHA256: ${{ inputs.wrapper_sha256 }}
+      BRIDGE_WORKFLOW_SHA256: ${{ inputs.workflow_sha256 }}
       BRIDGE_FAIL: ${{ inputs.fail_fixture }}
       BRIDGE_NONCE: ${{ inputs.nonce }}
       BRIDGE_DRAFT_ID: ${{ inputs.draft_release_id }}

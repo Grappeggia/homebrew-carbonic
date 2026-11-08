@@ -1,7 +1,7 @@
-"""Generic, fixture-only hosted CMS bridge. Public output is fixed stage codes.
+"""Hosted exact-source CMS bridge. Public output is fixed stage codes.
 
 Keep this and capsule.py at software/publishing/macos/ in the public checkout.
-Never use this wrapper for product sources: fixture inventory and bytes are fixed.
+Production invokes only the fixed exact-source pipeline in native_production.py.
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -64,7 +65,8 @@ def integer(value):
 
 
 def inputs(env):
-    require(env.get('BRIDGE_MODE') == 'fixture', 'production_disabled')
+    mode = env.get('BRIDGE_MODE')
+    require(mode in ('fixture', 'production'), 'mode')
     repo = env.get('GITHUB_REPOSITORY', '')
     require(re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo), 'repository')
     ref = env.get('GITHUB_WORKFLOW_REF', '')
@@ -85,12 +87,82 @@ def inputs(env):
                   draft_release_id=integer(env.get('BRIDGE_DRAFT_ID')),
                   fail_fixture=env['BRIDGE_FAIL'] == 'true')
     require(result['attempt'] == 1, 'rerun_refused')
+    if mode == 'production':
+        import native_production as production
+        require(result['source'] == production.SOURCE and not result['fail_fixture'], 'production_source')
+        result.update(mode='production', wrapper_sha256=hexval(env.get('BRIDGE_WRAPPER_SHA256'), 64),
+                      workflow_sha256=hexval(env.get('BRIDGE_WORKFLOW_SHA256'), 64))
     return result
+
+
+def identity_fields(config):
+    return FIELDS + (('mode', 'wrapper_sha256', 'workflow_sha256') if config.get('mode') == 'production' else ())
+
+
+def schema(config, phase):
+    return 'native-' + ('production' if config.get('mode') == 'production' else 'fixture') + '.' + phase + '.v1'
+
+
+def return_policy(config):
+    if config.get('mode') == 'production':
+        import native_production as production
+        return production.MAX_RETURN, production.MAX_MEMBER, production.EVIDENCE | {n + '.log' for n in PROBE_NAMES}, production.PRODUCTS
+    return MAX_PAYLOAD, MAX_PAYLOAD, EVIDENCE_NAMES, PRODUCT_NAMES
 
 
 def binding(actual, expected):
     require(all(type(actual.get(k)) is type(expected[k]) and actual.get(k) == expected[k]
-                for k in FIELDS), 'binding')
+                for k in identity_fields(expected)), 'binding')
+
+
+def parse_public_identity(raw, config, phase):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            require(key not in value, 'public_identity')
+            value[key] = item
+        return value
+    return public_identity(json.loads(raw, object_pairs_hook=unique), config, phase)
+
+
+def public_identity(value, config, phase):
+    """Exact public wire schemas; private diagnostics belong only in ciphertext."""
+    require(type(value) is dict and phase in ('recipient', 'return'), 'public_identity')
+    extra = ({'recipient_cert_sha256', 'tools'} if phase == 'recipient' else
+             {'outcome', 'toolsummary', 'plaintext_sha256', 'plaintext_bytes',
+              'ciphertext_sha256', 'ciphertext_bytes'})
+    require(set(value) == set(identity_fields(config)) | {'schema'} | extra,
+            'public_identity')
+    binding(value, config)
+    require(value['schema'] == schema(config, phase), 'public_identity')
+    if phase == 'recipient':
+        hexval(value['recipient_cert_sha256'], 64)
+        tools = value['tools']
+        require(type(tools) is dict, 'public_tools')
+        if config.get('mode') == 'production':
+            require(set(tools) == {'openssl_3'} and tools['openssl_3'] is True, 'public_tools')
+        else:
+            require(set(tools) == {'openssl', 'python', *PROBE_NAMES}, 'public_tools')
+            require(type(tools['openssl']) is str and len(tools['openssl']) <= 1024
+                    and tools['openssl'].startswith('OpenSSL 3.') and '\n' not in tools['openssl']
+                    and type(tools['python']) is str
+                    and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*', tools['python']), 'public_tools')
+            for name in PROBE_NAMES:
+                require(type(tools[name]) is dict and set(tools[name]) == {'exit'}
+                        and type(tools[name]['exit']) is int and -255 <= tools[name]['exit'] <= 255,
+                        'public_tools')
+    else:
+        require(type(value['outcome']) is str and value['outcome'] in ('success', 'failure'), 'public_identity')
+        summary = value['toolsummary']
+        require(type(summary) is dict and set(summary) == {'openssl_3', 'native_failed'}
+                and summary['openssl_3'] is True and type(summary['native_failed']) is bool
+                and (value['outcome'] == 'failure' or summary['native_failed'] is False), 'public_tools')
+        cap = return_policy(config)[0]
+        for prefix in ('plaintext', 'ciphertext'):
+            hexval(value[prefix + '_sha256'], 64)
+            require(type(value[prefix + '_bytes']) is int and 0 < value[prefix + '_bytes'] <= cap,
+                    'public_identity')
+    return value
 
 
 def write_json(path, value):
@@ -125,23 +197,45 @@ def build_env(root, original=None):
            'HOMEBREW_LOGS': str(root / 'brew-logs'),
            'HOMEBREW_TEMP': str(root / 'tmp'), 'HOMEBREW_NO_AUTO_UPDATE': '1',
            'HOMEBREW_NO_ANALYTICS': '1', 'GIT_CONFIG_NOSYSTEM': '1',
-           'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0'}
+           'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_SYSTEM': os.devnull,
+           'GIT_NO_REPLACE_OBJECTS': '1', 'GIT_TERMINAL_PROMPT': '0',
+           'PUB_CACHE': str(root / 'pub-cache'), 'CMAKE_BUILD_PARALLEL_LEVEL': '2',
+           'FLUTTER_SUPPRESS_ANALYTICS': 'true', 'CI': 'true'}
+    if (root / 'sdk/flutter/bin/flutter').is_file():
+        env['PATH'] = str(root / 'sdk/flutter/bin') + os.pathsep + env['PATH']
     for key in ('TMPDIR', 'XDG_CACHE_HOME', 'HOMEBREW_CACHE', 'HOMEBREW_LOGS'):
         Path(env[key]).mkdir(mode=0o700, parents=True, exist_ok=True)
     return env
 
 
-def capture(argv, root, name, *, cwd=None, timeout=180):
+def capture(argv, root, name, *, cwd=None, timeout=180, process_group=False):
     """Every native stdout/stderr byte stays in an explicit private file."""
     log = root / 'evidence' / (name + '.log')
     with log.open('xb') as stream:
         try:
+            if process_group:
+                return private_process(argv, root, stream, cwd=cwd, timeout=timeout)
             proc = subprocess.run(argv, cwd=cwd, env=build_env(root), stdout=stream,
                                   stderr=subprocess.STDOUT, timeout=timeout, check=False)
             return proc.returncode
         except (OSError, subprocess.TimeoutExpired):
             stream.write(b'private command unavailable or timed out\n')
             return 125
+
+
+def private_process(argv, root, stdout, *, stderr=subprocess.STDOUT, cwd=None, timeout=600):
+    """Bound a production process group so timed-out grandchildren cannot linger."""
+    proc = subprocess.Popen(argv, cwd=cwd, env=build_env(root), stdout=stdout,
+                            stderr=stderr, start_new_session=True)
+    try:
+        return proc.wait(timeout=timeout)
+    finally:
+        # Even a nominally successful parent must not leave build children alive.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=5)
 
 
 def openssl3(root):
@@ -325,16 +419,20 @@ def seal(root, config, openssl, result):
     """Explicit returned paths: never archive source, keys, or the private root."""
     cert = root / 'source/.carbonic/return.pem'
     require(cert.is_file() and digest(cert.read_bytes()) == config['return_cert_sha256'], 'return_cert')
+    cap, member_cap, evidence_names, product_names = return_policy(config)
     outputs = {}
+    total = 0
     for folder in ('evidence', 'products'):
         directory = root / folder
         if directory.exists():
             for path in sorted(directory.iterdir()):
                 require(path.is_file() and not path.is_symlink()
-                        and path.stat().st_size <= MAX_PAYLOAD, 'return_inventory')
-                require(path.name in (EVIDENCE_NAMES if folder == 'evidence' else PRODUCT_NAMES),
+                        and path.stat().st_size <= member_cap, 'return_inventory')
+                require(path.name in (evidence_names if folder == 'evidence' else product_names),
                         'return_inventory')
                 require(path.name != 'result.json', 'result_exists')
+                total += path.stat().st_size
+                require(total <= cap and len(outputs) < 64, 'return_size')
                 outputs[folder + '/' + path.name] = dict(
                     sha256=digest(path.read_bytes()), bytes=path.stat().st_size)
     result['outputs'] = outputs
@@ -345,32 +443,40 @@ def seal(root, config, openssl, result):
             directory = root / folder
             if directory.exists():
                 for path in sorted(directory.iterdir()):
-                    require(path.is_file() and not path.is_symlink() and path.stat().st_size <= MAX_PAYLOAD,
+                    require(path.is_file() and not path.is_symlink() and path.stat().st_size <= member_cap,
                             'return_inventory')
                     archive.add(path, arcname=folder + '/' + path.name, recursive=False)
-    require(0 < archive_path.stat().st_size <= MAX_PAYLOAD, 'return_size')
+    require(0 < archive_path.stat().st_size <= cap, 'return_size')
     plain_hash = digest(archive_path.read_bytes())
     output = root / 'public-return'
     output.mkdir(mode=0o700)
     cms = output / 'encrypted-return.cms'
     encrypted = capsule.encrypt(archive_path, cert, cms, openssl=openssl)
-    require(cms.is_file() and 0 < cms.stat().st_size <= MAX_PAYLOAD
+    require(cms.is_file() and 0 < cms.stat().st_size <= cap
             and cms.stat().st_size == encrypted['bytes'], 'seal_failed')
-    identity = {k: config[k] for k in FIELDS}
-    identity.update(schema='native-fixture.return.v1', outcome=result['outcome'],
+    identity = {k: config[k] for k in identity_fields(config)}
+    identity.update(schema=schema(config, 'return'), outcome=result['outcome'],
                     toolsummary=dict(openssl_3=True, native_failed=result['native_failed']),
                     plaintext_sha256=plain_hash, plaintext_bytes=archive_path.stat().st_size,
                     ciphertext_sha256=encrypted['sha256'], ciphertext_bytes=encrypted['bytes'])
+    public_identity(identity, config, 'return')
     write_json(output / 'identity.json', identity)
     archive_path.unlink()
     return identity
 
 
 def initialize(root, config):
+    if config.get('mode') == 'production':
+        import native_production as production
+        actual = production.wrapper_identity(Path(__file__).parent,
+            Path(os.environ['GITHUB_WORKSPACE']) / '.github/workflows/native-capsule.yml')
+        require(all(actual[k] == config[k] for k in actual), 'wrapper_identity')
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
     os.chmod(root, 0o700)
     (root / 'evidence').mkdir(mode=0o700)
     openssl, version = openssl3(root)
+    if config.get('mode') == 'production':
+        (root / 'evidence/openssl.log').write_text(version + '\n')
     # capsule's subprocess environment must point at this job-local project.
     capsule.PROJECT = root
     keys = capsule.keygen(root / 'recipient', openssl=openssl)
@@ -384,9 +490,11 @@ def initialize(root, config):
         code = capture(command, root, name)
         tools[name] = {'exit': code}
         probes[name] = code
-    identity = {k: config[k] for k in FIELDS}
-    identity.update(schema='native-fixture.recipient.v1',
-                    recipient_cert_sha256=keys['certificate_sha256'], tools=tools)
+    identity = {k: config[k] for k in identity_fields(config)}
+    identity.update(schema=schema(config, 'recipient'),
+                    recipient_cert_sha256=keys['certificate_sha256'],
+                    tools=({'openssl_3': True} if config.get('mode') == 'production' else tools))
+    public_identity(identity, config, 'recipient')
     write_json(public / 'identity.json', identity)
     write_json(root / 'private-state.json', dict(config=config, openssl=openssl, probes=probes))
 
@@ -396,8 +504,8 @@ def execute(root, config, api):
     require(state['config'] == config, 'state_binding')
     openssl = state['openssl']
     capsule.PROJECT = root
-    result = {k: config[k] for k in FIELDS}
-    result.update(schema='native-fixture.result.v1', outcome='failure', native={}, protocol='failure',
+    result = {k: config[k] for k in identity_fields(config)}
+    result.update(schema=schema(config, 'result'), outcome='failure', native={}, protocol='failure',
                   native_failed=True, probes=state.get('probes', {}))
     source = root / 'source'
     key = root / 'recipient/recipient.key'
@@ -422,7 +530,11 @@ def execute(root, config, api):
         tar.unlink()
         require(set(result['probes']) == set(PROBE_NAMES)
                 and all(type(c) is int for c in result['probes'].values()), 'probe_inventory')
-        result['native'] = native_fixture(root, source, config)
+        if config.get('mode') == 'production':
+            import native_production as production
+            result['native'] = production.native(root, source, dict(config, openssl=openssl))
+        else:
+            result['native'] = native_fixture(root, source, config)
         result['protocol'] = 'ok'
         result['native_failed'] = any(v != 0 for v in result['native'].values())
         probes_ok = all(c == 0 for c in result['probes'].values()) and all(
@@ -445,6 +557,42 @@ def execute(root, config, api):
     return 0 if result['outcome'] == 'success' else 1
 
 
+# Exact owned private paths under the job root removed by the always() cleanup step.
+# Public certificate/ciphertext outputs (public-recipient, public-return) stay.
+# Production xcodebuild writes raw result bundles beside the Debug workspaces.
+PRIVATE_DIRECTORIES = ('source', 'recipient', 'products', 'evidence', 'tmp',
+                       'cache', 'brew-cache', 'brew-logs', 'design-r5', 'sdk', 'pub-cache',
+                       'debug-arm64', 'debug-x86_64',
+                       'runtime-arm64.xcresult', 'runtime-x86_64.xcresult')
+PRIVATE_FILES = ('capsule.tar', 'capsule.cms', 'return.tar', 'private-state.json',
+                 'sdk-version.json', 'reconstruct.tar')
+# capsule.verify_extract stages in <root>/capsule-* and capsule.decrypt writes
+# <root>/.cms-pending-*; both normally self-delete but survive a hard kill.
+PRIVATE_TEMP_PREFIXES = ('capsule-', '.cms-pending-')
+
+
+def cleanup(root):
+    """Best-effort ordinary deletion of owned private paths directly in root."""
+    for name in PRIVATE_DIRECTORIES:
+        shutil.rmtree(root / name, ignore_errors=True)
+    for name in PRIVATE_FILES:
+        (root / name).unlink(missing_ok=True)
+    try:
+        entries = list(root.iterdir()) if root.is_dir() and not root.is_symlink() else []
+    except OSError:
+        entries = []
+    for entry in entries:
+        if not entry.name.startswith(PRIVATE_TEMP_PREFIXES):
+            continue
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('phase', choices=('init', 'execute', 'cleanup'))
@@ -454,11 +602,7 @@ def main(argv=None):
         config = inputs(os.environ)
         root = layout(config, os.environ['GITHUB_WORKSPACE'])
         if args.phase == 'cleanup':
-            for name in ('source', 'recipient', 'products', 'evidence', 'tmp',
-                         'cache', 'brew-cache', 'brew-logs', 'design-r5'):
-                shutil.rmtree(root / name, ignore_errors=True)
-            for name in ('capsule.tar', 'capsule.cms', 'return.tar', 'private-state.json'):
-                (root / name).unlink(missing_ok=True)
+            cleanup(root)
             code = 0
         elif args.phase == 'init':
             initialize(root, config)
@@ -467,11 +611,13 @@ def main(argv=None):
             token = os.environ.pop('GH_TOKEN', '')
             os.environ.pop('GITHUB_TOKEN', None)
             code = execute(root, config, GitHub(token))
-        print('NATIVE_FIXTURE_OK' if code == 0 else 'NATIVE_FIXTURE_FAILED')
+        prefix = 'NATIVE_PRODUCTION' if config.get('mode') == 'production' else 'NATIVE_FIXTURE'
+        print(prefix + ('_OK' if code == 0 else '_FAILED'))
         return code
     except Exception:
         # Final boundary also suppresses unexpected tracebacks from dependencies.
-        print('NATIVE_FIXTURE_PROTOCOL_FAILED')
+        print('NATIVE_PRODUCTION_PROTOCOL_FAILED' if os.environ.get('BRIDGE_MODE') == 'production'
+              else 'NATIVE_FIXTURE_PROTOCOL_FAILED')
         return 1
 
 
