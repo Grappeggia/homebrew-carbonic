@@ -2,7 +2,7 @@ name: Public Carbonic cask smoke
 on:
   workflow_dispatch:
   push:
-    paths: ['Casks/**', '.github/workflows/macos-smoke.yml', '.github/scripts/**']
+    paths: ['Casks/**', '.github/workflows/macos-smoke.yml', '.github/scripts/**', 'install.sh']
 permissions:
   contents: read
 concurrency:
@@ -18,7 +18,7 @@ jobs:
         # existing Intel installations can still install the universal cask.
         runner: [macos-15, macos-15-intel]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    timeout-minutes: 50
     env:
       HOMEBREW_NO_AUTO_UPDATE: '1'
       HOMEBREW_NO_ANALYTICS: '1'
@@ -35,12 +35,20 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install the public tap and verify the actual payload
         shell: bash
+        # Step bound below the job bound so the evidence upload still runs on a hang.
+        timeout-minutes: 40
         run: |
           set -euo pipefail
           OUT="$GITHUB_WORKSPACE/build/evidence"
           APPDIR="$GITHUB_WORKSPACE/build/Applications"
           TOKEN=grappeggia/carbonic/carbonic
           mkdir -p "$OUT" "$APPDIR" "$TMPDIR" "$HOMEBREW_CACHE"
+          exec 9>>"$OUT/trace.log"
+          BASH_XTRACEFD=9
+          PS4='+ $(date -u +%H:%M:%S) '
+          set -x
+          uname -m > "$OUT/host-arch.txt"
+          command -v brew > "$OUT/brew-path.txt"
           cleanup() {
             result=$?
             trap - EXIT
@@ -189,6 +197,64 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: carbonic-direct-download-${{ matrix.runner }}
+          path: build/evidence/
+          retention-days: 30
+          if-no-files-found: error
+
+  install-script:
+    # One-command installer documented for Macs without Homebrew (Intel).
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15-intel, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      TMPDIR: ${{ github.workspace }}/build/tmp
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install with install.sh, verify, launch and uninstall
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/build/evidence"
+          export CARBONIC_APPDIR="$GITHUB_WORKSPACE/build/Applications"
+          export CARBONIC_TAP_REF="$GITHUB_SHA"
+          mkdir -p "$OUT" "$TMPDIR"
+          bash install.sh 2>&1 | tee "$OUT/install.txt"
+          APP="$CARBONIC_APPDIR/Carbonic.app"
+          xattr -p com.apple.quarantine "$APP" > "$OUT/quarantine.txt"
+          codesign --verify --deep --strict --verbose=2 "$APP" > "$OUT/codesign-verify.txt" 2>&1
+          SHA=$(sed -n 's/^  sha256 "\([0-9a-f]\{64\}\)"$/\1/p' Casks/carbonic.rb)
+          grep -q "Checksum verified: $SHA" "$OUT/install.txt"
+          set +e
+          spctl --assess --type execute --verbose=4 "$APP" > "$OUT/gatekeeper.txt" 2>&1
+          assessment=$?
+          set -e
+          test "$assessment" -ne 0
+          bash "$GITHUB_WORKSPACE/.github/scripts/runtime-launch.sh" "$APP" "$OUT"
+          # A tampered pin must be refused before anything is installed.
+          sed 's/^  sha256 "[0-9a-f]*"$/  sha256 "'"$(printf '0%.0s' $(seq 1 64))"'"/' Casks/carbonic.rb > "$OUT/tampered.rb"
+          mkdir -p "$TMPDIR/badtap/Casks" && cp "$OUT/tampered.rb" "$TMPDIR/badtap/Casks/carbonic.rb"
+          set +e
+          ( cd "$TMPDIR/badtap" && python3 -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 & echo $! > "$TMPDIR/srv.pid" )
+          sleep 2
+          sed 's#https://raw.githubusercontent.com/$REPO/$REF/Casks/carbonic.rb#http://127.0.0.1:8765/Casks/carbonic.rb#' install.sh > "$TMPDIR/install-badpin.sh"
+          CARBONIC_APPDIR="$GITHUB_WORKSPACE/build/BadApplications" bash "$TMPDIR/install-badpin.sh" > "$OUT/tampered-install.txt" 2>&1
+          bad=$?
+          kill "$(cat "$TMPDIR/srv.pid")"
+          set -e
+          test "$bad" -ne 0
+          grep -q "checksum mismatch" "$OUT/tampered-install.txt"
+          test ! -e "$GITHUB_WORKSPACE/build/BadApplications/Carbonic.app"
+          bash install.sh --uninstall | tee "$OUT/uninstall.txt"
+          test ! -e "$APP"
+          printf '%s\n' 'PASS install.sh pinned-checksum install, quarantine kept, integrity, expected Gatekeeper rejection, runtime launch, tampered pin refused, uninstall' > "$OUT/result.txt"
+      - name: Retain bounded install-script evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: carbonic-install-script-${{ matrix.runner }}
           path: build/evidence/
           retention-days: 30
           if-no-files-found: error
