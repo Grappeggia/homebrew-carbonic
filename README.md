@@ -24,12 +24,27 @@ brew upgrade --cask grappeggia/carbonic/carbonic
 brew uninstall --cask grappeggia/carbonic/carbonic
 ```
 
-## Intel Macs: direct download
+## Intel Macs
 
-Homebrew's installer supports only Apple silicon Macs, so a new Homebrew
-installation is not possible on an Intel Mac. Download the archive,
-`manifest.json` and `SHA256SUMS` from the
-[latest release](https://github.com/Grappeggia/homebrew-carbonic/releases/latest)
+Carbonic runs natively on Intel Macs. Homebrew's installer supports only Apple
+silicon, so a new Homebrew installation is not possible on Intel. Use one of:
+
+**Install script** (checks the same pinned SHA-256 as the cask, keeps macOS
+quarantine, no sudo):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Grappeggia/homebrew-carbonic/main/install.sh | bash
+```
+
+Uninstall with `curl -fsSL https://raw.githubusercontent.com/Grappeggia/homebrew-carbonic/main/install.sh | bash -s -- --uninstall`.
+Read the [script](install.sh) first if you prefer.
+
+**Existing Homebrew**: an Intel Mac that already has Homebrew can use the cask
+commands above. Homebrew treats Intel as unsupported (Tier 3) and prints a
+warning, but the cask is tested with both Homebrew 6 and 7 on Intel.
+
+**Manual download**: download the archive, `manifest.json` and `SHA256SUMS`
+from the [latest release](https://github.com/Grappeggia/homebrew-carbonic/releases/latest)
 into one folder, then verify them before opening the archive:
 
 ```bash
@@ -44,9 +59,9 @@ quit Carbonic and move it to the Trash; recordings remain on disk.
 The application is ad-hoc signed for local integrity. It is **not Developer ID
 signed or notarized by Apple**. macOS can block the first launch. After reviewing
 the checksum and deciding to trust the prototype, open System Settings → Privacy
-& Security and use Open Anyway, then approve the normal macOS prompt. Homebrew
-and the direct download both preserve macOS quarantine and first-launch
-protections.
+& Security and use Open Anyway, then approve the normal macOS prompt. Homebrew,
+the install script and the manual download all preserve macOS quarantine and
+first-launch protections.
 
 Homebrew uninstall quits Carbonic and removes the application; recordings remain
 on disk. No `zap` operation is configured. Bluetooth access still needs your permission.
