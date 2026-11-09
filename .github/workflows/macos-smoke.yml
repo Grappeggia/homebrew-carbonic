@@ -17,6 +17,11 @@ jobs:
         # preinstalled Homebrew (Tier 3, unsupported by Homebrew) and shows whether
         # existing Intel installations can still install the universal cask.
         runner: [macos-15, macos-15-intel]
+        brew_update: [false]
+        include:
+          # Real Intel users auto-update to the current (Tier 3 on Intel) Homebrew.
+          - runner: macos-15-intel
+            brew_update: true
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 50
     env:
@@ -31,6 +36,7 @@ jobs:
       TEMP: ${{ github.workspace }}/build/tmp
       XDG_CACHE_HOME: ${{ github.workspace }}/build/cache
       XDG_CONFIG_HOME: ${{ github.workspace }}/build/config
+      BREW_UPDATE: ${{ matrix.brew_update }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install the public tap and verify the actual payload
@@ -49,6 +55,9 @@ jobs:
           set -x
           uname -m > "$OUT/host-arch.txt"
           command -v brew > "$OUT/brew-path.txt"
+          if [ "$BREW_UPDATE" = true ]; then
+            HOMEBREW_NO_AUTO_UPDATE= brew update > "$OUT/brew-update.txt" 2>&1
+          fi
           cleanup() {
             result=$?
             trap - EXIT
@@ -127,7 +136,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: carbonic-public-macos-smoke-${{ matrix.runner }}
+          name: carbonic-public-macos-smoke-${{ matrix.runner }}${{ matrix.brew_update && '-brew-updated' || '' }}
           path: build/evidence/
           retention-days: 30
           if-no-files-found: error
