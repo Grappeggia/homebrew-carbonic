@@ -2,7 +2,7 @@ name: Public Carbonic cask smoke
 on:
   workflow_dispatch:
   push:
-    paths: ['Casks/**', '.github/workflows/macos-smoke.yml']
+    paths: ['Casks/**', '.github/workflows/macos-smoke.yml', '.github/scripts/**']
 permissions:
   contents: read
 concurrency:
@@ -10,8 +10,15 @@ concurrency:
   cancel-in-progress: false
 jobs:
   install-public-cask:
-    runs-on: macos-15
-    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Apple silicon is the supported Homebrew platform. The Intel runner has a
+        # preinstalled Homebrew (Tier 3, unsupported by Homebrew) and shows whether
+        # existing Intel installations can still install the universal cask.
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
     env:
       HOMEBREW_NO_AUTO_UPDATE: '1'
       HOMEBREW_NO_ANALYTICS: '1'
@@ -103,15 +110,85 @@ jobs:
           printf '%s\n' "$assessment" > "$OUT/gatekeeper-exit.txt"
           test "$assessment" -ne 0
           grep -qi rejected "$OUT/gatekeeper.txt"
+          bash "$GITHUB_WORKSPACE/.github/scripts/runtime-launch.sh" "$APP" "$OUT"
           brew upgrade --cask --appdir="$APPDIR" "$TOKEN" 2>&1 | tee "$OUT/upgrade-current.txt"
           brew uninstall --cask "$TOKEN" 2>&1 | tee "$OUT/uninstall.txt"
           test ! -e "$APP"
-          printf '%s\n' 'PASS public download checksum, cask install, native identity/universal2/integrity/quarantine, expected Gatekeeper rejection, upgrade-current command, uninstall' > "$OUT/result.txt"
+          printf '%s\n' 'PASS public download checksum, cask install, native identity/universal2/integrity/quarantine, expected Gatekeeper rejection, runtime launch, upgrade-current command, uninstall' > "$OUT/result.txt"
       - name: Retain bounded public installation evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: carbonic-public-macos-smoke
+          name: carbonic-public-macos-smoke-${{ matrix.runner }}
+          path: build/evidence/
+          retention-days: 30
+          if-no-files-found: error
+
+  direct-download:
+    # README route for Intel Macs (and any Mac without Homebrew).
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15-intel, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      TMPDIR: ${{ github.workspace }}/build/tmp
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Download, verify and install the latest release directly
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/build/evidence"
+          DL="$GITHUB_WORKSPACE/build/download"
+          APPDIR="$GITHUB_WORKSPACE/build/Applications"
+          mkdir -p "$OUT" "$DL" "$APPDIR" "$TMPDIR"
+          cd "$DL"
+          BASE=https://github.com/Grappeggia/homebrew-carbonic/releases/latest/download
+          for f in manifest.json SHA256SUMS; do
+            curl --fail --location --retry 2 --max-time 120 "$BASE/$f" --output "$f"
+          done
+          ZIP=$(python3 -c "import json; print(json.load(open('manifest.json'))['artifact']['name'])")
+          curl --fail --location --retry 2 --max-time 180 "$BASE/$ZIP" --output "$ZIP"
+          shasum -a 256 -c SHA256SUMS | tee "$OUT/sha256sums-check.txt"
+          python3 - "$ZIP" <<'PY'
+          import hashlib, json, pathlib, sys
+          manifest = json.loads(pathlib.Path('manifest.json').read_text())
+          archive = pathlib.Path(sys.argv[1])
+          assert manifest['artifact']['name'] == archive.name
+          assert archive.stat().st_size == manifest['artifact']['bytes']
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == manifest['artifact']['sha256']
+          assert manifest['architectures'] == ['arm64', 'x86_64']
+          PY
+          cp manifest.json "$OUT/manifest.json"
+          # Same quarantine a browser download receives; ditto keeps it on extraction.
+          xattr -w com.apple.quarantine "0083;$(printf %x "$(date +%s)");Safari;$(uuidgen)" "$ZIP"
+          ditto -xk "$ZIP" "$APPDIR"
+          APP="$APPDIR/Carbonic.app"
+          xattr -p com.apple.quarantine "$APP" > "$OUT/quarantine.txt" 2>&1 || echo "not propagated by ditto" > "$OUT/quarantine.txt"
+          codesign --verify --deep --strict --verbose=2 "$APP" > "$OUT/codesign-verify.txt" 2>&1
+          codesign -d --verbose=4 "$APP" > "$OUT/codesign-details.txt" 2>&1
+          grep -q 'Signature=adhoc' "$OUT/codesign-details.txt"
+          codesign -d --entitlements - --xml "$APP" 2>/dev/null | plutil -p - > "$OUT/entitlements.txt"
+          grep -q 'com.apple.security.app-sandbox" => true\|com.apple.security.app-sandbox" => 1' "$OUT/entitlements.txt"
+          lipo -archs "$APP/Contents/MacOS/Carbonic" > "$OUT/archs.txt"
+          grep -q x86_64 "$OUT/archs.txt"
+          grep -q arm64 "$OUT/archs.txt"
+          set +e
+          spctl --assess --type execute --verbose=4 "$APP" > "$OUT/gatekeeper.txt" 2>&1
+          assessment=$?
+          set -e
+          printf '%s\n' "$assessment" > "$OUT/gatekeeper-exit.txt"
+          test "$assessment" -ne 0
+          grep -qi rejected "$OUT/gatekeeper.txt"
+          bash "$GITHUB_WORKSPACE/.github/scripts/runtime-launch.sh" "$APP" "$OUT"
+          printf '%s\n' 'PASS direct download checksums/manifest, ad-hoc integrity, sandbox entitlement, universal2, expected Gatekeeper rejection, runtime launch' > "$OUT/result.txt"
+      - name: Retain bounded direct-download evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: carbonic-direct-download-${{ matrix.runner }}
           path: build/evidence/
           retention-days: 30
           if-no-files-found: error
